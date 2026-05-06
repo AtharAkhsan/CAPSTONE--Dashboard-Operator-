@@ -1,0 +1,714 @@
+"""
+==========================================================================
+  CAPSTONE PROJECT — Dashboard Operator
+  Sistem Verifikasi Kuantitas Part Mikro
+  Sensor Fusion: Kamera AI (Density Map Estimation) + Load Cell
+==========================================================================
+  Framework  : Streamlit
+  AI Model   : MobileNetV2 + Dilated Convolution (DME)
+  Checkpoint : checkpoints/final_dme_97percent.pth
+==========================================================================
+"""
+
+import os
+import time
+import random
+import sqlite3
+import uuid
+from datetime import datetime
+
+import cv2
+import numpy as np
+import torch
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import streamlit as st
+from dotenv import load_dotenv
+from supabase import create_client
+
+# Import arsitektur model dari file proyek
+from model_dme import DensityMapRegressor
+
+
+# ============================================================
+# KONSTANTA & KONFIGURASI
+# ============================================================
+
+CHECKPOINT_PATH = os.path.join("checkpoints", "final_dme_97percent.pth")
+
+# Resolusi target model (sama seperti saat training)
+TARGET_W, TARGET_H = 672, 512
+
+# Resolusi asli webcam
+CAM_W, CAM_H = 1920, 1080
+
+# Ukuran center crop (4:3) untuk membuang distorsi lensa cembung di pinggir
+CROP_W, CROP_H = 1440, 1080
+
+# Normalisasi standar ImageNet
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+# Scaling factor yang digunakan saat training loss
+SCALING_FACTOR = 1000.0
+
+# Database Master Parts
+PARTS_DB = {
+    "SPR-0012": {"name": "Spur Gear 2.5g", "vendor": "PT. Sejahtera", "target_qty": 100, "base_weight": 2.50},
+    "PST-8821": {"name": "Piston Ring 5g", "vendor": "PT. Makmur", "target_qty": 250, "base_weight": 5.00},
+    "BRG-400X": {"name": "Bearing 10g", "vendor": "PT. Sukses", "target_qty": 500, "base_weight": 10.00}
+}
+
+
+# ============================================================
+# DATABASES: SQLite & Supabase
+# ============================================================
+
+load_dotenv()
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+@st.cache_resource
+def init_supabase():
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            return create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            st.error(f"Supabase init error: {e}")
+    return None
+
+supabase_client = init_supabase()
+
+def init_sqlite():
+    conn = sqlite3.connect("local_data.db", check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS verification_logs (
+            id TEXT PRIMARY KEY,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            part_code TEXT,
+            target_qty REAL,
+            ai_count REAL,
+            load_cell_count REAL,
+            final_count REAL,
+            diff_pct REAL,
+            status TEXT,
+            is_synced INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    return conn
+
+if "sqlite_conn" not in st.session_state:
+    st.session_state.sqlite_conn = init_sqlite()
+
+def save_to_local_db(part_code, target_qty, ai_count, lc_count, final_count, diff_pct, status):
+    log_id = str(uuid.uuid4())
+    conn = st.session_state.sqlite_conn
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO verification_logs (id, part_code, target_qty, ai_count, load_cell_count, final_count, diff_pct, status, is_synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+    ''', (log_id, part_code, target_qty, float(ai_count), float(lc_count), float(final_count), float(diff_pct), status))
+    conn.commit()
+
+def sync_to_supabase():
+    if not supabase_client:
+        return False, "Supabase belum dikonfigurasi (.env)"
+    
+    conn = st.session_state.sqlite_conn
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, timestamp, part_code, target_qty, ai_count, load_cell_count, final_count, diff_pct, status FROM verification_logs WHERE is_synced = 0')
+    rows = cursor.fetchall()
+    
+    if not rows:
+        return True, "Semua data sudah sinkron dengan Supabase."
+        
+    success_count = 0
+    for row in rows:
+        # Konversi SQLite CURRENT_TIMESTAMP (YYYY-MM-DD HH:MM:SS) ke format ISO8601
+        ts = row[1]
+        if ' ' in ts:
+            ts = ts.replace(' ', 'T') + 'Z'
+            
+        data = {
+            "id": row[0],
+            "timestamp": ts, 
+            "part_code": row[2],
+            "target_qty": row[3],
+            "ai_count": row[4],
+            "load_cell_count": row[5],
+            "final_count": row[6],
+            "diff_pct": row[7],
+            "status": row[8]
+        }
+        try:
+            supabase_client.table("verification_logs").insert(data).execute()
+            # Update local db status
+            cursor.execute('UPDATE verification_logs SET is_synced = 1 WHERE id = ?', (row[0],))
+            conn.commit()
+            success_count += 1
+        except Exception as e:
+            print(f"Error syncing {row[0]}: {e}")
+            
+    return True, f"Berhasil sinkronisasi {success_count} data."
+
+
+# ============================================================
+# FUNGSI: Device Selection
+# ============================================================
+
+def select_device():
+    """Deteksi device: CUDA > MPS > CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+# ============================================================
+# FUNGSI: Load Model (cached agar tidak reload setiap frame)
+# ============================================================
+
+@st.cache_resource
+def load_model():
+    """
+    Load model DensityMapRegressor dari checkpoint.
+    Menggunakan @st.cache_resource agar model hanya di-load SEKALI
+    dan tetap di memory selama aplikasi berjalan.
+    """
+    device = select_device()
+
+    model = DensityMapRegressor(pretrained=False)
+    model = model.to(device)
+
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    epoch    = checkpoint.get("epoch", "?")
+    best_mae = checkpoint.get("best_mae", "?")
+
+    return model, device, epoch, best_mae
+
+
+# ============================================================
+# FUNGSI: Inference Transform
+# ============================================================
+
+@st.cache_resource
+def get_inference_transform():
+    """Pipeline preprocessing: Normalize + ToTensor (tanpa resize)."""
+    return A.Compose([
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+
+
+# ============================================================
+# FUNGSI: Center Crop
+# ============================================================
+
+def center_crop(frame, crop_w=CROP_W, crop_h=CROP_H):
+    """
+    Potong bagian tengah frame untuk membuang distorsi lensa cembung.
+    Input  : frame 1920x1080 (BGR)
+    Output : frame 1440x1080 (BGR) — area tengah saja
+    """
+    h, w = frame.shape[:2]
+    x_start = (w - crop_w) // 2
+    y_start = (h - crop_h) // 2
+    return frame[y_start : y_start + crop_h, x_start : x_start + crop_w]
+
+
+# ============================================================
+# FUNGSI: Pre-processing Frame untuk Model
+# ============================================================
+
+def preprocess_frame(frame_rgb, transform):
+    """
+    Resize frame ke TARGET (672x512) lalu normalize + convert ke tensor.
+    Returns: (tensor, display_frame_rgb)
+      - tensor         : untuk input ke model
+      - display_frame  : frame 672x512 RGB untuk ditampilkan
+    """
+    resized = cv2.resize(frame_rgb, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
+    display_frame = resized.copy()
+
+    transformed = transform(image=resized)
+    tensor = transformed["image"]  # (C, H, W)
+
+    return tensor, display_frame
+
+
+# ============================================================
+# FUNGSI: Inference → Density Map + Count
+# ============================================================
+
+def run_inference(model, tensor, device):
+    """
+    Jalankan forward pass model pada satu frame.
+    Returns: (density_map_numpy, predicted_count)
+    """
+    tensor = tensor.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = model(tensor)  # (1, 1, H, W)
+
+    # Hilangkan scaling factor training
+    density_map = (output / SCALING_FACTOR).squeeze().cpu().numpy()
+    predicted_count = float(density_map.sum())
+
+    return density_map, predicted_count
+
+
+# ============================================================
+# FUNGSI: Heatmap Overlay
+# ============================================================
+
+def create_heatmap_overlay(display_frame_rgb, density_map, alpha=0.5):
+    """
+    Gabungkan density map heatmap (JET) dengan frame RGB.
+    Keduanya sudah berukuran 672x512.
+    """
+    if density_map.max() > 0:
+        norm = (density_map / density_map.max() * 255).astype(np.uint8)
+    else:
+        norm = np.zeros_like(density_map, dtype=np.uint8)
+
+    heatmap_bgr = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+
+    overlay = cv2.addWeighted(display_frame_rgb, alpha, heatmap_rgb, 1 - alpha, 0)
+    return overlay
+
+
+# ============================================================
+# FUNGSI: Mockup Load Cell  (GANTI DENGAN PYSERIAL NANTI)
+# ============================================================
+
+def get_load_cell_weight(ai_count, base_weight):
+    """
+    *** MOCKUP / DUMMY ***
+    Mensimulasikan keluaran berat dari Load Cell dalam GRAM.
+    """
+    # Beri sedikit noise berat (gram)
+    noise_g = random.uniform(-0.5, 0.5) 
+    # Misal tebakan LC meleset maksimal +/- 2 pcs
+    noise_count = random.randint(-2, 2)
+    
+    simulated_weight = ((round(ai_count) + noise_count) * base_weight) + noise_g
+    return max(0.0, simulated_weight)
+
+
+# ============================================================
+# FUNGSI: Logika Sensor Fusion
+# ============================================================
+
+def sensor_fusion(ai_count, live_weight, base_weight, target_qty):
+    """
+    Logika Sensor Fusion:
+    """
+    weight_estimation_pcs = round(live_weight / base_weight)
+    
+    discrepancy = weight_estimation_pcs - target_qty
+
+    if discrepancy >= -3 and discrepancy <= 3:
+        status = "PASS"
+        status_color = "green"
+        text = "OK"
+    else:
+        status = "REJECT"
+        status_color = "red"
+        text = "NG"
+
+    return weight_estimation_pcs, discrepancy, status, status_color, text
+
+
+# ============================================================
+# STREAMLIT: Page Config & Custom CSS
+# ============================================================
+
+st.set_page_config(
+    page_title="Dashboard Operator — Verifikasi Part Mikro",
+    page_icon="🏭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# CSS untuk tampilan industrial / profesional
+st.markdown("""
+<style>
+    /* --- Font --- */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&family=JetBrains+Mono:wght@400;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+
+    /* --- Header bar --- */
+    .main-header {
+        background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+        padding: 18px 28px;
+        border-radius: 12px;
+        margin-bottom: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+    .main-header h1 {
+        color: #ffffff;
+        font-size: 1.5rem;
+        font-weight: 900;
+        margin: 0;
+        letter-spacing: 1px;
+    }
+    .main-header .subtitle {
+        color: #8ecae6;
+        font-size: 0.85rem;
+        font-weight: 400;
+    }
+
+    /* --- Panel card --- */
+    .panel-card {
+        background: #1a1a2e;
+        border: 1px solid #30305a;
+        border-radius: 12px;
+        padding: 20px;
+        margin-bottom: 16px;
+    }
+    .panel-card h3 {
+        color: #8ecae6;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.95rem;
+        margin-bottom: 12px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+    }
+
+    /* --- Status badges --- */
+    .status-verified {
+        background: linear-gradient(90deg, #064e3b, #059669);
+        color: #d1fae5;
+        padding: 14px 20px;
+        border-radius: 10px;
+        font-size: 1.15rem;
+        font-weight: 700;
+        text-align: center;
+        font-family: 'JetBrains Mono', monospace;
+        letter-spacing: 1px;
+    }
+    .status-warning {
+        background: linear-gradient(90deg, #7f1d1d, #991b1b);
+        color: #fca5a5;
+        padding: 14px 20px;
+        border-radius: 10px;
+        font-size: 1.15rem;
+        font-weight: 700;
+        text-align: center;
+        font-family: 'JetBrains Mono', monospace;
+        letter-spacing: 1px;
+    }
+
+    /* --- Metric override --- */
+    [data-testid="stMetric"] {
+        background: #16213e;
+        border: 1px solid #30305a;
+        border-radius: 10px;
+        padding: 14px 18px;
+    }
+    [data-testid="stMetricLabel"] {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        color: #8ecae6 !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-family: 'JetBrains Mono', monospace;
+        font-weight: 900;
+        font-size: 2rem;
+        color: #ffffff !important;
+    }
+
+    /* --- Sidebar --- */
+    [data-testid="stSidebar"] {
+        background: #0d1b2a;
+    }
+
+    /* --- Hide Streamlit branding --- */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# STREAMLIT: Header
+# ============================================================
+
+st.markdown("""
+<div class="main-header">
+    <div>
+        <h1>🏭 Dashboard Operator — Verifikasi Part Mikro</h1>
+        <span class="subtitle">Sensor Fusion: Kamera AI (Density Map Estimation) + Load Cell</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# STREAMLIT: Sidebar — Kontrol Kamera & Info Model
+# ============================================================
+
+with st.sidebar:
+    st.markdown("### ⚙️ Kontrol Sistem")
+    st.divider()
+    
+    # Pilihan Part
+    st.markdown("### 📦 Informasi Part")
+    selected_part_code = st.selectbox("Pilih Part Code", options=list(PARTS_DB.keys()))
+    part_info = PARTS_DB[selected_part_code]
+    
+    st.markdown(f"**Name:** {part_info['name']}")
+    st.markdown(f"**Vendor:** {part_info['vendor']}")
+    st.markdown(f"**Target Qty:** {part_info['target_qty']} pcs")
+    st.markdown(f"**Base Weight:** {part_info['base_weight']} g")
+    
+    st.divider()
+
+    # Tombol Start / Stop
+    if "camera_running" not in st.session_state:
+        st.session_state.camera_running = False
+
+    col_start, col_stop = st.columns(2)
+    with col_start:
+        if st.button("▶ START", use_container_width=True, type="primary"):
+            st.session_state.camera_running = True
+    with col_stop:
+        if st.button("⏹ STOP", use_container_width=True):
+            st.session_state.camera_running = False
+
+    status_text = "🟢 AKTIF" if st.session_state.camera_running else "🔴 NONAKTIF"
+    st.markdown(f"**Status Kamera:** {status_text}")
+
+    st.divider()
+
+    # Pengaturan kamera
+    st.markdown("### 📷 Pengaturan Kamera")
+    camera_index = st.selectbox("Indeks Kamera", [0, 1, 2], index=0)
+    show_heatmap = st.checkbox("Tampilkan Heatmap Overlay", value=True)
+    heatmap_alpha = st.slider("Opacity Frame (vs Heatmap)", 0.2, 0.8, 0.5, 0.05)
+
+    st.divider()
+
+    # Info model
+    st.markdown("### 🧠 Info Model AI")
+    if os.path.exists(CHECKPOINT_PATH):
+        model, device, epoch, best_mae = load_model()
+        st.success(f"Model loaded pada **{device}**")
+        st.markdown(f"- **Arsitektur:** MobileNetV2 + Dilated Conv")
+        st.markdown(f"- **Checkpoint:** `final_dme_97percent.pth`")
+        st.markdown(f"- **Epoch:** {epoch}")
+        st.markdown(f"- **Best MAE:** {best_mae}")
+        st.markdown(f"- **Input Size:** {TARGET_W}×{TARGET_H}")
+    else:
+        st.error(f"Checkpoint tidak ditemukan!\n`{CHECKPOINT_PATH}`")
+        st.stop()
+
+    st.divider()
+    st.markdown("### ☁️ Sinkronisasi Data")
+    if st.button("🔄 Sync ke Supabase", use_container_width=True):
+        with st.spinner("Menyinkronkan data..."):
+            success, msg = sync_to_supabase()
+            if success:
+                st.success(msg)
+            else:
+                st.error(msg)
+                
+    st.divider()
+    st.caption("Capstone Project — Sistem Verifikasi Kuantitas Part Mikro")
+
+
+# ============================================================
+# STREAMLIT: Layout Utama — 2 Kolom
+# ============================================================
+
+col_camera, col_panel = st.columns([3, 2], gap="large")
+
+# --- Kolom Kiri: Live Camera Feed ---
+with col_camera:
+    st.markdown('<div class="panel-card"><h3>📹 Live Camera Feed</h3></div>',
+                unsafe_allow_html=True)
+    frame_placeholder = st.empty()
+    fps_placeholder   = st.empty()
+
+# --- Kolom Kanan: Panel Indikator ---
+with col_panel:
+    st.markdown('<div class="panel-card"><h3>📊 Panel Verifikasi</h3></div>',
+                unsafe_allow_html=True)
+                
+    st.markdown(f"**Current Inspection:** {part_info['name']} ({selected_part_code})")
+    
+    st.markdown("---")
+
+    metric_ai     = st.empty()
+    metric_lc     = st.empty()
+    metric_final  = st.empty()
+
+    st.markdown("---")
+    status_placeholder = st.empty()
+    diff_placeholder   = st.empty()
+
+    st.markdown("---")
+    log_placeholder = st.empty()
+
+
+# ============================================================
+# STREAMLIT: Loop Utama — Real-time Inference
+# ============================================================
+
+if st.session_state.camera_running:
+    if "last_save_time" not in st.session_state:
+        st.session_state.last_save_time = time.time()
+        
+    transform = get_inference_transform()
+    cap = cv2.VideoCapture(camera_index)
+
+    # Set resolusi webcam
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+
+    if not cap.isOpened():
+        st.error("❌ Gagal membuka kamera! Periksa koneksi dan indeks kamera.")
+        st.session_state.camera_running = False
+        st.stop()
+
+    frame_count = 0
+
+    while st.session_state.camera_running:
+        t_start = time.time()
+
+        ret, frame_bgr = cap.read()
+        if not ret:
+            st.warning("⚠️ Tidak dapat membaca frame dari kamera.")
+            break
+
+        # --------------------------------------------------
+        # STEP 1: Center Crop (1920x1080 → 1440x1080)
+        # Membuang distorsi cembung di pinggir lensa
+        # --------------------------------------------------
+        cropped = center_crop(frame_bgr, CROP_W, CROP_H)
+
+        # Konversi ke RGB
+        cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+
+        # --------------------------------------------------
+        # STEP 2: Resize ke 672x512 + Normalisasi → Tensor
+        # --------------------------------------------------
+        tensor, display_frame = preprocess_frame(cropped_rgb, transform)
+
+        # --------------------------------------------------
+        # STEP 3: Inference AI — Density Map Estimation
+        # --------------------------------------------------
+        density_map, ai_count = run_inference(model, tensor, device)
+
+        # --------------------------------------------------
+        # STEP 4: Heatmap Overlay
+        # --------------------------------------------------
+        if show_heatmap:
+            overlay = create_heatmap_overlay(display_frame, density_map, alpha=heatmap_alpha)
+            frame_to_show = overlay
+        else:
+            frame_to_show = display_frame
+
+        # --------------------------------------------------
+        # STEP 5: Load Cell (Mockup) -> GRAM
+        # --------------------------------------------------
+        live_weight_g = get_load_cell_weight(ai_count, part_info['base_weight'])
+
+        # --------------------------------------------------
+        # STEP 6: Sensor Fusion
+        # --------------------------------------------------
+        weight_est_pcs, discrepancy, status, status_color, text_ng = sensor_fusion(ai_count, live_weight_g, part_info['base_weight'], part_info['target_qty'])
+
+        # --------------------------------------------------
+        # STEP 7: Update UI
+        # --------------------------------------------------
+        frame_placeholder.image(frame_to_show, caption="Live Feed (672×512)", use_container_width=True)
+
+        # Metrics
+        metric_ai.metric("🤖 AI Visual Count", f"{round(ai_count)} pcs")
+        metric_lc.metric("⚖️ Live Weight Data", f"{live_weight_g:.2f} g")
+        metric_final.metric("📊 Weight Estimation", f"{weight_est_pcs} pcs")
+
+        # Status badge
+        if status_color == "green":
+            status_placeholder.markdown(
+                f'<div class="status-verified">Final Decision: {status}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            status_placeholder.markdown(
+                f'<div class="status-warning">Final Decision: {status}</div>',
+                unsafe_allow_html=True,
+            )
+
+        diff_placeholder.markdown(
+            f"<p style='text-align:center; color:#94a3b8; font-size:0.9rem;'>"
+            f"Discrepancy: <b>{discrepancy} pcs, {text_ng}</b></p>",
+            unsafe_allow_html=True,
+        )
+
+        # FPS
+        t_end = time.time()
+        fps = 1.0 / max(t_end - t_start, 1e-6)
+        frame_count += 1
+        fps_placeholder.caption(f"⚡ FPS: {fps:.1f} — Frame #{frame_count}")
+
+        # Log
+        log_placeholder.markdown(
+            f"<div style='background:#0d1b2a; padding:10px; border-radius:8px;"
+            f" font-family:JetBrains Mono,monospace; font-size:0.75rem; color:#64748b;'>"
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"AI={round(ai_count)} | W={live_weight_g:.1f}g | "
+            f"Est={weight_est_pcs} | Δ={discrepancy} | "
+            f"Status={status}</div>",
+            unsafe_allow_html=True,
+        )
+
+        # --------------------------------------------------
+        # STEP 8: Auto Save to Local DB (Setiap 5 detik)
+        # --------------------------------------------------
+        if time.time() - st.session_state.last_save_time >= 5.0:
+            save_to_local_db(selected_part_code, part_info['target_qty'], round(ai_count), live_weight_g, weight_est_pcs, discrepancy, status)
+            st.session_state.last_save_time = time.time()
+            st.toast("💾 Data tersimpan ke database lokal (Auto-Save 5s)")
+
+    # Cleanup
+    cap.release()
+
+else:
+    # Tampilan idle ketika kamera belum dinyalakan
+    with col_camera:
+        frame_placeholder.markdown(
+            "<div style='background:#0d1b2a; border:2px dashed #30305a;"
+            " border-radius:12px; height:400px; display:flex;"
+            " align-items:center; justify-content:center;'>"
+            "<p style='color:#64748b; font-size:1.1rem;'>"
+            "📷 Tekan <b>START</b> di sidebar untuk memulai kamera"
+            "</p></div>",
+            unsafe_allow_html=True,
+        )
+
+    with col_panel:
+        st.markdown(f"**Current Inspection:** {part_info['name']} ({selected_part_code})")
+        st.markdown("---")
+        metric_ai.metric("🤖 AI Visual Count", "—")
+        metric_lc.metric("⚖️ Live Weight Data", "—")
+        metric_final.metric("📊 Weight Estimation", "—")
+        status_placeholder.markdown(
+            '<div class="status-verified" style="opacity:0.4;">STANDBY</div>',
+            unsafe_allow_html=True,
+        )
