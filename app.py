@@ -54,9 +54,8 @@ SCALING_FACTOR = 1000.0
 
 # Database Master Parts
 PARTS_DB = {
-    "SPR-0012": {"name": "Spur Gear 2.5g", "vendor": "PT. Sejahtera", "target_qty": 100, "base_weight": 2.50},
-    "PST-8821": {"name": "Piston Ring 5g", "vendor": "PT. Makmur", "target_qty": 250, "base_weight": 5.00},
-    "BRG-400X": {"name": "Bearing 10g", "vendor": "PT. Sukses", "target_qty": 500, "base_weight": 10.00}
+    "JPS-0001": {"name": "JP Screw", "vendor": "PT. Why-Fi", "target_qty": 100, "base_weight": 0.87},
+    "SPR-0012": {"name": "Spur Gear 2.5g", "vendor": "PT. Sejahtera", "target_qty": 100, "base_weight": 2.50}
 }
 
 
@@ -66,18 +65,20 @@ PARTS_DB = {
 
 load_dotenv()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 @st.cache_resource
-def init_supabase():
-    if SUPABASE_URL and SUPABASE_KEY:
+def init_supabase(api_key):
+    if SUPABASE_URL and api_key:
         try:
-            return create_client(SUPABASE_URL, SUPABASE_KEY)
+            return create_client(SUPABASE_URL, api_key)
         except Exception as e:
             st.error(f"Supabase init error: {e}")
     return None
 
-supabase_client = init_supabase()
+supabase_client = init_supabase(SUPABASE_ANON_KEY)
+supabase_write_client = init_supabase(SUPABASE_SERVICE_ROLE_KEY)
 
 def init_sqlite():
     conn = sqlite3.connect("local_data.db", check_same_thread=False)
@@ -92,66 +93,163 @@ def init_sqlite():
             load_cell_count REAL,
             final_count REAL,
             diff_pct REAL,
+            image_url TEXT,
             status TEXT,
             is_synced INTEGER DEFAULT 0
         )
     ''')
+
+    # Migrasi ringan untuk DB lama yang belum punya kolom image_url.
+    cursor.execute("PRAGMA table_info(verification_logs)")
+    existing_cols = [row[1] for row in cursor.fetchall()]
+    if "image_url" not in existing_cols:
+        cursor.execute("ALTER TABLE verification_logs ADD COLUMN image_url TEXT")
+
     conn.commit()
     return conn
 
 if "sqlite_conn" not in st.session_state:
     st.session_state.sqlite_conn = init_sqlite()
 
-def save_to_local_db(part_code, target_qty, ai_count, lc_count, final_count, diff_pct, status):
-    log_id = str(uuid.uuid4())
+def save_to_local_db(part_code, target_qty, ai_count, lc_count, final_count, diff_pct, status, image_url=None, log_id=None):
+    if log_id is None:
+        log_id = str(uuid.uuid4())
+
     conn = st.session_state.sqlite_conn
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO verification_logs (id, part_code, target_qty, ai_count, load_cell_count, final_count, diff_pct, status, is_synced)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-    ''', (log_id, part_code, target_qty, float(ai_count), float(lc_count), float(final_count), float(diff_pct), status))
+        INSERT INTO verification_logs (id, part_code, target_qty, ai_count, load_cell_count, final_count, diff_pct, image_url, status, is_synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    ''', (log_id, part_code, target_qty, float(ai_count), float(lc_count), float(final_count), float(diff_pct), image_url, status))
     conn.commit()
+    return log_id
 
 def sync_to_supabase():
-    if not supabase_client:
-        return False, "Supabase belum dikonfigurasi (.env)"
+    if not supabase_write_client:
+        return False, "SUPABASE_SERVICE_ROLE_KEY belum dikonfigurasi. RLS memblokir insert/update dengan anon key."
     
     conn = st.session_state.sqlite_conn
     cursor = conn.cursor()
-    cursor.execute('SELECT id, timestamp, part_code, target_qty, ai_count, load_cell_count, final_count, diff_pct, status FROM verification_logs WHERE is_synced = 0')
+    cursor.execute('SELECT id, timestamp, part_code, target_qty, ai_count, load_cell_count, final_count, diff_pct, image_url, status FROM verification_logs WHERE is_synced = 0')
     rows = cursor.fetchall()
     
     if not rows:
         return True, "Semua data sudah sinkron dengan Supabase."
-        
-    success_count = 0
+
+    payloads = []
+    synced_ids = []
+
     for row in rows:
         # Konversi SQLite CURRENT_TIMESTAMP (YYYY-MM-DD HH:MM:SS) ke format ISO8601
         ts = row[1]
-        if ' ' in ts:
+        if isinstance(ts, str) and ' ' in ts:
             ts = ts.replace(' ', 'T') + 'Z'
-            
-        data = {
+
+        payloads.append({
             "id": row[0],
-            "timestamp": ts, 
+            "timestamp": ts,
             "part_code": row[2],
             "target_qty": row[3],
             "ai_count": row[4],
             "load_cell_count": row[5],
             "final_count": row[6],
             "diff_pct": row[7],
-            "status": row[8]
-        }
-        try:
-            supabase_client.table("verification_logs").insert(data).execute()
-            # Update local db status
-            cursor.execute('UPDATE verification_logs SET is_synced = 1 WHERE id = ?', (row[0],))
-            conn.commit()
-            success_count += 1
-        except Exception as e:
-            print(f"Error syncing {row[0]}: {e}")
-            
-    return True, f"Berhasil sinkronisasi {success_count} data."
+            "image_url": row[8],
+            "status": row[9],
+        })
+        synced_ids.append(row[0])
+
+    try:
+        # Upsert menangani data baru dan data duplikat berdasarkan primary key `id`.
+        supabase_write_client.table("verification_logs").upsert(payloads, on_conflict="id").execute()
+
+        cursor.executemany(
+            'UPDATE verification_logs SET is_synced = 1 WHERE id = ?',
+            [(row_id,) for row_id in synced_ids],
+        )
+        conn.commit()
+
+        return True, f"Berhasil sinkronisasi {len(synced_ids)} data."
+    except Exception as e:
+        print(f"Batch sync error: {e}")
+        return False, f"Gagal sinkronisasi ke Supabase: {e}"
+
+
+def sync_single_log_to_supabase(log_id):
+    """
+    Sinkronisasi satu log berdasarkan id.
+    Dipakai saat manual save agar dashboard bisa langsung membaca log terbaru.
+    """
+    if not supabase_write_client:
+        return False, "SUPABASE_SERVICE_ROLE_KEY belum dikonfigurasi."
+
+    conn = st.session_state.sqlite_conn
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT id, timestamp, part_code, target_qty, ai_count, load_cell_count, final_count, diff_pct, image_url, status FROM verification_logs WHERE id = ?',
+        (log_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return False, f"Log {log_id} tidak ditemukan di database lokal."
+
+    ts = row[1]
+    if isinstance(ts, str) and ' ' in ts:
+        ts = ts.replace(' ', 'T') + 'Z'
+
+    payload = {
+        "id": row[0],
+        "timestamp": ts,
+        "part_code": row[2],
+        "target_qty": row[3],
+        "ai_count": row[4],
+        "load_cell_count": row[5],
+        "final_count": row[6],
+        "diff_pct": row[7],
+        "image_url": row[8],
+        "status": row[9],
+    }
+
+    try:
+        supabase_write_client.table("verification_logs").upsert(payload, on_conflict="id").execute()
+        cursor.execute('UPDATE verification_logs SET is_synced = 1 WHERE id = ?', (log_id,))
+        conn.commit()
+        return True, "Log berhasil sinkron ke Supabase."
+    except Exception as e:
+        return False, f"Gagal sinkron log ke Supabase: {e}"
+
+
+# ============================================================
+# FUNGSI: Supabase Telemetry Storage (Table-Based)
+# ============================================================
+def save_telemetry_to_supabase(part_code, part_name, vendor, target_qty, ai_count, weight_data, base_weight, decision, status, discrepancy):
+    """
+    Simpan snapshot telemetry ke tabel Supabase.
+    Ini adalah jalur aman untuk telemetry: tidak memakai broadcast channel.
+    """
+    if not supabase_write_client:
+        return False, "SUPABASE_SERVICE_ROLE_KEY belum dikonfigurasi."
+
+    payload = {
+        "id": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "part_code": part_code,
+        "part_name": part_name,
+        "vendor": vendor,
+        "target_qty": target_qty,
+        "ai_count": ai_count,
+        "weight_data": weight_data,
+        "base_weight": base_weight,
+        "decision": decision,
+        "status": status,
+        "discrepancy": discrepancy,
+    }
+
+    try:
+        supabase_write_client.table("telemetry_logs").insert(payload).execute()
+        return True, "Telemetry tersimpan ke Supabase."
+    except Exception as e:
+        return False, f"Gagal simpan telemetry ke Supabase: {e}"
 
 
 # ============================================================
@@ -285,6 +383,87 @@ def create_heatmap_overlay(display_frame_rgb, density_map, alpha=0.5):
 
 
 # ============================================================
+# FUNGSI: Upload Camera Snapshot ke Supabase Storage
+# ============================================================
+
+def upload_camera_snapshot(frame_rgb, bucket_name="camera_snapshots", file_name="latest_frame.jpg"):
+    """
+    Upload frame gambar ke Supabase Storage untuk Live Inspection di React Dashboard.
+    
+    Args:
+        frame_rgb: Frame RGB dari OpenCV (NumPy array)
+        bucket_name: Nama bucket di Supabase Storage (default: "camera_snapshots")
+        file_name: Nama file di bucket (default: "latest_frame.jpg") — akan di-upsert
+    
+    Returns:
+        True jika upload berhasil, False jika gagal
+    """
+    if not supabase_write_client:
+        return False
+    
+    try:
+        # Konversi RGB ke BGR untuk OpenCV (OpenCV bekerja dengan BGR)
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        
+        # Encode frame menjadi JPEG dengan kompresi 60% (lebih ringan & cepat upload)
+        ret, buffer = cv2.imencode('.jpg', frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        
+        if not ret:
+            print("[Camera Snapshot] Gagal encode frame ke JPEG")
+            return False
+        
+        # Konversi buffer ke byte array
+        file_bytes = buffer.tobytes()
+        
+        # Upload ke Supabase Storage dengan upsert=True (menimpa file lama)
+        res = supabase_write_client.storage.from_(bucket_name).upload(
+            file_name,
+            file_bytes,
+            file_options={"content_type": "image/jpeg", "upsert": "true"}
+        )
+        
+        return True
+    
+    except Exception as e:
+        print(f"[Camera Snapshot] Error uploading snapshot: {e}")
+        return False
+
+
+def upload_inspection_proof(frame_rgb, log_id, bucket_name="camera_snapshots"):
+    """
+    Upload snapshot bukti inspeksi per-log dan kembalikan public URL-nya.
+    File menggunakan nama unik berbasis log_id agar cocok dengan timestamp log.
+    """
+    if not supabase_write_client:
+        return None
+
+    try:
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        ret, buffer = cv2.imencode('.jpg', frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        if not ret:
+            print("[Inspection Proof] Gagal encode frame ke JPEG")
+            return None
+
+        file_name = f"snapshot_{log_id}.jpg"
+        file_bytes = buffer.tobytes()
+
+        supabase_write_client.storage.from_(bucket_name).upload(
+            file_name,
+            file_bytes,
+            file_options={"content_type": "image/jpeg", "upsert": "true"},
+        )
+
+        public_url = supabase_write_client.storage.from_(bucket_name).get_public_url(file_name)
+        if isinstance(public_url, dict):
+            return public_url.get("publicURL") or public_url.get("publicUrl")
+        return public_url
+
+    except Exception as e:
+        print(f"[Inspection Proof] Error upload proof: {e}")
+        return None
+
+
+# ============================================================
 # FUNGSI: Mockup Load Cell  (GANTI DENGAN PYSERIAL NANTI)
 # ============================================================
 
@@ -311,10 +490,13 @@ def sensor_fusion(ai_count, live_weight, base_weight, target_qty):
     Logika Sensor Fusion:
     """
     weight_estimation_pcs = round(live_weight / base_weight)
-    
-    discrepancy = weight_estimation_pcs - target_qty
 
-    if discrepancy >= -3 and discrepancy <= 3:
+    # Keputusan final harus dibandingkan terhadap target, bukan terhadap AI count.
+    discrepancy = weight_estimation_pcs - target_qty
+    reference_count = max(abs(target_qty), 1)
+    discrepancy_pct = abs(discrepancy) / reference_count * 100
+
+    if discrepancy_pct <= 3:
         status = "PASS"
         status_color = "green"
         text = "OK"
@@ -484,10 +666,10 @@ with st.sidebar:
 
     col_start, col_stop = st.columns(2)
     with col_start:
-        if st.button("▶ START", use_container_width=True, type="primary"):
+        if st.button("▶ START", width="stretch", type="primary"):
             st.session_state.camera_running = True
     with col_stop:
-        if st.button("⏹ STOP", use_container_width=True):
+        if st.button("⏹ STOP", width="stretch"):
             st.session_state.camera_running = False
 
     status_text = "🟢 AKTIF" if st.session_state.camera_running else "🔴 NONAKTIF"
@@ -500,6 +682,10 @@ with st.sidebar:
     camera_index = st.selectbox("Indeks Kamera", [0, 1, 2], index=0)
     show_heatmap = st.checkbox("Tampilkan Heatmap Overlay", value=True)
     heatmap_alpha = st.slider("Opacity Frame (vs Heatmap)", 0.2, 0.8, 0.5, 0.05)
+    # Telemetry aman: simpan snapshot ke tabel Supabase
+    enable_telemetry = st.checkbox("Simpan Telemetry ke Supabase", value=False)
+    if enable_telemetry and not SUPABASE_SERVICE_ROLE_KEY:
+        st.warning("Aktifkan `SUPABASE_SERVICE_ROLE_KEY` di `.env` untuk menyimpan telemetry ke Supabase.")
 
     st.divider()
 
@@ -519,13 +705,23 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### ☁️ Sinkronisasi Data")
-    if st.button("🔄 Sync ke Supabase", use_container_width=True):
-        with st.spinner("Menyinkronkan data..."):
-            success, msg = sync_to_supabase()
-            if success:
-                st.success(msg)
-            else:
-                st.error(msg)
+    if SUPABASE_SERVICE_ROLE_KEY:
+        if st.button("🔄 Sync ke Supabase", width="stretch"):
+            with st.spinner("Menyinkronkan data..."):
+                success, msg = sync_to_supabase()
+                if success:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+    else:
+        st.button("🔄 Sync ke Supabase", width="stretch", disabled=True)
+        st.warning(
+            "SUPABASE_SERVICE_ROLE_KEY belum dikonfigurasi. Tambahkan ke `.env` agar sinkronisasi bisa menulis ke tabel yang dilindungi RLS."
+        )
+        st.code(
+            "SUPABASE_SERVICE_ROLE_KEY=your_service_role_key_here",
+            language="text",
+        )
                 
     st.divider()
     st.caption("Capstone Project — Sistem Verifikasi Kuantitas Part Mikro")
@@ -543,6 +739,20 @@ with col_camera:
                 unsafe_allow_html=True)
     frame_placeholder = st.empty()
     fps_placeholder   = st.empty()
+    
+    st.markdown("---")
+    st.markdown("### 💾 Simpan Data")
+    if "manual_save_requested" not in st.session_state:
+        st.session_state.manual_save_requested = False
+
+    if st.button("💾 Save ke Database Lokal", width="stretch", disabled=not st.session_state.camera_running):
+        st.session_state.manual_save_requested = True
+        st.toast("Permintaan simpan diterima. Data akan disimpan dari pembacaan terbaru.")
+
+    if not st.session_state.camera_running:
+        st.caption("Aktifkan kamera (START) untuk mengaktifkan tombol simpan.")
+    else:
+        st.caption("Klik untuk menyimpan satu record dari pembacaan terbaru.")
 
 # --- Kolom Kanan: Panel Indikator ---
 with col_panel:
@@ -570,8 +780,10 @@ with col_panel:
 # ============================================================
 
 if st.session_state.camera_running:
-    if "last_save_time" not in st.session_state:
-        st.session_state.last_save_time = time.time()
+    if "last_telemetry_time" not in st.session_state:
+        st.session_state.last_telemetry_time = 0.0
+    if "last_snapshot_upload_time" not in st.session_state:
+        st.session_state.last_snapshot_upload_time = 0.0
         
     transform = get_inference_transform()
     cap = cv2.VideoCapture(camera_index)
@@ -636,7 +848,7 @@ if st.session_state.camera_running:
         # --------------------------------------------------
         # STEP 7: Update UI
         # --------------------------------------------------
-        frame_placeholder.image(frame_to_show, caption="Live Feed (672×512)", use_container_width=True)
+        frame_placeholder.image(frame_to_show, caption="Live Feed (672×512)", width="stretch")
 
         # Metrics
         metric_ai.metric("🤖 AI Visual Count", f"{round(ai_count)} pcs")
@@ -679,12 +891,66 @@ if st.session_state.camera_running:
         )
 
         # --------------------------------------------------
-        # STEP 8: Auto Save to Local DB (Setiap 5 detik)
+        # STEP 8: Upload Camera Snapshot ke Supabase (Setiap 1.5 detik)
         # --------------------------------------------------
-        if time.time() - st.session_state.last_save_time >= 5.0:
-            save_to_local_db(selected_part_code, part_info['target_qty'], round(ai_count), live_weight_g, weight_est_pcs, discrepancy, status)
-            st.session_state.last_save_time = time.time()
-            st.toast("💾 Data tersimpan ke database lokal (Auto-Save 5s)")
+        if SUPABASE_SERVICE_ROLE_KEY and (time.time() - st.session_state.last_snapshot_upload_time >= 1.5):
+            upload_ok = upload_camera_snapshot(frame_to_show, bucket_name="camera_snapshots", file_name="latest_frame.jpg")
+            if upload_ok:
+                print(f"[{time.strftime('%H:%M:%S')}] Camera snapshot uploaded to Supabase Storage")
+            st.session_state.last_snapshot_upload_time = time.time()
+
+        # --------------------------------------------------
+        # STEP 9: Manual Save ke Local DB (via tombol)
+        # --------------------------------------------------
+        if st.session_state.get("manual_save_requested", False):
+            log_id = str(uuid.uuid4())
+            proof_url = None
+
+            if SUPABASE_SERVICE_ROLE_KEY:
+                proof_url = upload_inspection_proof(frame_to_show, log_id=log_id, bucket_name="camera_snapshots")
+
+            save_to_local_db(
+                selected_part_code,
+                part_info['target_qty'],
+                round(ai_count),
+                live_weight_g,
+                weight_est_pcs,
+                discrepancy,
+                status,
+                image_url=proof_url,
+                log_id=log_id,
+            )
+
+            if SUPABASE_SERVICE_ROLE_KEY:
+                sync_ok, sync_msg = sync_single_log_to_supabase(log_id)
+                if not sync_ok:
+                    st.toast(sync_msg)
+
+            st.session_state.manual_save_requested = False
+            if proof_url:
+                st.toast("💾 Data & snapshot bukti inspeksi berhasil disimpan")
+            else:
+                st.toast("💾 Data tersimpan, tetapi URL snapshot bukti belum tersedia")
+
+        # --------------------------------------------------
+        # STEP 10: Telemetry ke Supabase (Setiap ~1 detik jika diaktifkan)
+        # --------------------------------------------------
+        if enable_telemetry and SUPABASE_SERVICE_ROLE_KEY and (time.time() - st.session_state.last_telemetry_time >= 1.0):
+            telemetry_ok, telemetry_msg = save_telemetry_to_supabase(
+                part_code=selected_part_code,
+                part_name=part_info['name'],
+                vendor=part_info['vendor'],
+                target_qty=part_info['target_qty'],
+                ai_count=round(ai_count),
+                weight_data=live_weight_g,
+                base_weight=part_info['base_weight'],
+                decision=status,
+                status=("ok" if status == "PASS" else "ng"),
+                discrepancy=discrepancy,
+            )
+            st.session_state.last_telemetry_time = time.time()
+            if not telemetry_ok:
+                st.toast(telemetry_msg)
 
     # Cleanup
     cap.release()
