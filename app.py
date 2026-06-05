@@ -15,6 +15,8 @@ import time
 import random
 import sqlite3
 import uuid
+import json           # <--- Baru
+import serial       # <--- Baru
 from datetime import datetime
 
 import cv2
@@ -107,6 +109,34 @@ def init_sqlite():
 
     conn.commit()
     return conn
+
+
+def save_app_config(key, value):
+    """Simpan konfigurasi aplikasi sederhana ke tabel `app_config`."""
+    conn = st.session_state.sqlite_conn
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS app_config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    cursor.execute('REPLACE INTO app_config (key, value) VALUES (?, ?)', (key, json.dumps(value)))
+    conn.commit()
+
+
+def load_app_config(key, default=None):
+    """Muat konfigurasi dari `app_config` jika ada, kembalikan default jika tidak."""
+    conn = st.session_state.sqlite_conn
+    cursor = conn.cursor()
+    try:
+        cursor.execute('SELECT value FROM app_config WHERE key = ?', (key,))
+        row = cursor.fetchone()
+        if row:
+            return json.loads(row[0])
+    except Exception:
+        pass
+    return default
 
 if "sqlite_conn" not in st.session_state:
     st.session_state.sqlite_conn = init_sqlite()
@@ -464,21 +494,57 @@ def upload_inspection_proof(frame_rgb, log_id, bucket_name="camera_snapshots"):
 
 
 # ============================================================
-# FUNGSI: Mockup Load Cell  (GANTI DENGAN PYSERIAL NANTI)
+# FUNGSI: Pembacaan Load Cell via Serial (Real-Time)
 # ============================================================
+
+# testing
 
 def get_load_cell_weight(ai_count, base_weight):
     """
-    *** MOCKUP / DUMMY ***
-    Mensimulasikan keluaran berat dari Load Cell dalam GRAM.
+    Membaca data JSON dari Arduino Uno via Serial.
+    Menggunakan in_waiting agar tidak memblokir (lagging) frame rate kamera.
     """
-    # Beri sedikit noise berat (gram)
-    noise_g = random.uniform(-0.5, 0.5) 
-    # Misal tebakan LC meleset maksimal +/- 2 pcs
-    noise_count = random.randint(-2, 2)
-    
-    simulated_weight = ((round(ai_count) + noise_count) * base_weight) + noise_g
-    return max(0.0, simulated_weight)
+    # Inisialisasi nilai konfigurasi/calibration di session state
+    if "last_raw_weight" not in st.session_state:
+        st.session_state.last_raw_weight = 0.0
+    if "last_weight" not in st.session_state:
+        st.session_state.last_weight = 0.0
+    if "lc_calibration_factor" not in st.session_state:
+        # muat dari DB jika tersedia
+        st.session_state.lc_calibration_factor = load_app_config("lc_calibration_factor", 1.0)
+    if "lc_tare_raw" not in st.session_state:
+        st.session_state.lc_tare_raw = load_app_config("lc_tare_raw", 0.0)
+
+    if "serial_conn" in st.session_state and st.session_state.serial_conn is not None:
+        try:
+            ser = st.session_state.serial_conn
+            last_valid_line = None
+
+            # Kuras semua data yang menumpuk di buffer, ambil yang paling baru
+            while ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                # Pastikan format JSON utuh
+                if line.startswith("{") and line.endswith("}"):
+                    last_valid_line = line
+
+            if last_valid_line:
+                data = json.loads(last_valid_line)
+                # Ambil key "berat" sesuai format print JSON dari Arduino
+                raw = float(data.get("berat", 0.0))
+                st.session_state.last_raw_weight = raw
+
+        except Exception:
+            # Jika ada error parsing (misal kabel tersenggol), biarkan pakai nilai terakhir
+            pass
+
+    # Konversi raw -> gram menggunakan faktor kalibrasi dan offset tare
+    grams = (st.session_state.last_raw_weight - st.session_state.lc_tare_raw) * st.session_state.lc_calibration_factor
+    # Lindungi dari -ve kecil
+    if grams < 0 and abs(grams) < 0.0001:
+        grams = 0.0
+
+    st.session_state.last_weight = float(grams)
+    return st.session_state.last_weight
 
 
 # ============================================================
@@ -689,6 +755,94 @@ with st.sidebar:
 
     st.divider()
 
+    # Load Cell
+
+    st.markdown("### 🔌 Koneksi Timbangan (Arduino)")
+    
+    # Deteksi OS untuk memberikan contoh format port yang relevan
+    contoh_port = "COM3" if os.name == 'nt' else "/dev/ttyUSB0"
+    com_port = st.text_input("Port Serial", value=contoh_port)
+    
+    col_conn, col_disc = st.columns(2)
+    with col_conn:
+        if st.button("🔌 Connect", width="stretch"):
+            try:
+                # Tutup koneksi lama jika ada
+                if "serial_conn" in st.session_state and st.session_state.serial_conn is not None:
+                    st.session_state.serial_conn.close()
+                
+                # Buka port dengan baudrate 9600 dan timeout sangat kecil agar tidak lag
+                st.session_state.serial_conn = serial.Serial(com_port, 9600, timeout=0.05)
+                time.sleep(2) # Tunggu Arduino reset sesaat setelah port dibuka
+                st.toast(f"✅ Terhubung ke {com_port}", icon="✅")
+            except Exception as e:
+                st.error(f"Gagal koneksi: Periksa port dan kabel!")
+                st.session_state.serial_conn = None
+
+    with col_disc:
+        if st.button("Disconnect", width="stretch"):
+            if "serial_conn" in st.session_state and st.session_state.serial_conn is not None:
+                st.session_state.serial_conn.close()
+                st.session_state.serial_conn = None
+                st.toast("🔌 Serial diputus.")
+
+    # Status indikator
+    if "serial_conn" in st.session_state and st.session_state.serial_conn is not None and st.session_state.serial_conn.is_open:
+        st.markdown("**Status Load Cell:** 🟢 Terhubung")
+    else:
+        st.markdown("**Status Load Cell:** 🔴 Terputus")
+
+    # --- Kalibrasi & Tare ---
+    if "lc_calibration_factor" not in st.session_state:
+        st.session_state.lc_calibration_factor = load_app_config("lc_calibration_factor", 1.0)
+    if "lc_tare_raw" not in st.session_state:
+        st.session_state.lc_tare_raw = load_app_config("lc_tare_raw", 0.0)
+    if "last_raw_weight" not in st.session_state:
+        st.session_state.last_raw_weight = 0.0
+    if "last_weight" not in st.session_state:
+        st.session_state.last_weight = 0.0
+
+    st.markdown("### ⚖️ Kalibrasi Timbangan")
+    st.markdown(f"- Faktor Kalibrasi: **{st.session_state.lc_calibration_factor:.6f}**")
+    st.markdown(f"- Offset Tare (raw): **{st.session_state.lc_tare_raw:.3f}**")
+    st.markdown(f"- Last Raw: **{st.session_state.last_raw_weight:.3f}** → {st.session_state.last_weight:.2f} g")
+
+    col_tare, col_cal = st.columns(2)
+    with col_tare:
+        if st.button("TARE (Set Zero)", use_container_width=True):
+            # Ambil pembacaan raw terakhir sebagai tare
+            st.session_state.lc_tare_raw = float(st.session_state.get("last_raw_weight", 0.0))
+            save_app_config("lc_tare_raw", st.session_state.lc_tare_raw)
+            st.toast(f"Tare diset ke {st.session_state.lc_tare_raw:.3f} (raw)")
+    with col_cal:
+        if st.button("Reset Kalibrasi", use_container_width=True):
+            st.session_state.lc_calibration_factor = 1.0
+            save_app_config("lc_calibration_factor", st.session_state.lc_calibration_factor)
+            st.toast("Faktor kalibrasi direset ke 1.0")
+
+    st.markdown("#### Kalibrasi dengan beban diketahui")
+    known_w = st.number_input("Known weight (grams)", min_value=0.0, value=50.0, step=1.0)
+    if st.button("Kalibrasi dengan Known Weight", use_container_width=True):
+        measured_raw = float(st.session_state.get("last_raw_weight", 0.0))
+        tare = float(st.session_state.get("lc_tare_raw", 0.0))
+        denom = (measured_raw - tare)
+        if denom <= 0:
+            st.error("Tidak dapat kalibrasi: pembacaan raw <= tare. Pastikan beban ada dan stabil.")
+        else:
+            factor = float(known_w) / denom
+            st.session_state.lc_calibration_factor = factor
+            save_app_config("lc_calibration_factor", st.session_state.lc_calibration_factor)
+            st.toast(f"Kalibrasi selesai: faktor={st.session_state.lc_calibration_factor:.6f}")
+
+    st.markdown("#### Atur manual faktor kalibrasi")
+    new_factor = st.number_input("Manual factor", min_value=0.000001, value=float(st.session_state.lc_calibration_factor), format="%.6f")
+    if st.button("Simpan Faktor Manual", use_container_width=True):
+        st.session_state.lc_calibration_factor = float(new_factor)
+        save_app_config("lc_calibration_factor", st.session_state.lc_calibration_factor)
+        st.toast(f"Faktor kalibrasi disimpan: {st.session_state.lc_calibration_factor:.6f}")
+
+    st.divider()
+    
     # Info model
     st.markdown("### 🧠 Info Model AI")
     if os.path.exists(CHECKPOINT_PATH):
