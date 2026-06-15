@@ -36,7 +36,7 @@ from model_dme import DensityMapRegressor
 # KONSTANTA & KONFIGURASI
 # ============================================================
 
-CHECKPOINT_PATH = os.path.join("checkpoints", "final_dme_97percent.pth")
+CHECKPOINT_PATH = os.path.join("checkpoints", "best_dme_model.pth")
 
 # Resolusi target model (sama seperti saat training)
 TARGET_W, TARGET_H = 672, 512
@@ -523,15 +523,24 @@ def get_load_cell_weight(ai_count, base_weight):
             # Kuras semua data yang menumpuk di buffer, ambil yang paling baru
             while ser.in_waiting > 0:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
-                # Pastikan format JSON utuh
+                # Pastikan format JSON utuh atau format teks dari Arduino
                 if line.startswith("{") and line.endswith("}"):
+                    last_valid_line = line
+                elif "berat terbaca:" in line:
                     last_valid_line = line
 
             if last_valid_line:
-                data = json.loads(last_valid_line)
-                # Ambil key "berat" sesuai format print JSON dari Arduino
-                raw = float(data.get("berat", 0.0))
-                st.session_state.last_raw_weight = raw
+                if last_valid_line.startswith("{"):
+                    data = json.loads(last_valid_line)
+                    # Ambil key "berat" sesuai format print JSON dari Arduino
+                    raw = float(data.get("berat", 0.0))
+                    st.session_state.last_raw_weight = raw
+                elif "berat terbaca:" in last_valid_line:
+                    # Format: berat terbaca: 10.5 g | berat satuan: 0.0 g | jumlah barang: 0 pcs
+                    parts = last_valid_line.split("|")
+                    if len(parts) > 0:
+                        berat_str = parts[0].replace("berat terbaca:", "").replace("g", "").strip()
+                        st.session_state.last_raw_weight = float(berat_str)
 
         except Exception:
             # Jika ada error parsing (misal kabel tersenggol), biarkan pakai nilai terakhir
@@ -556,9 +565,12 @@ def sensor_fusion(ai_count, live_weight, base_weight, target_qty):
     Logika Sensor Fusion:
     """
     weight_estimation_pcs = round(live_weight / base_weight)
+    
+    # Menghitung nilai rata-rata dari estimasi berat dan estimasi kamera vision
+    final_count = round((weight_estimation_pcs + round(ai_count)) / 2)
 
-    # Keputusan final harus dibandingkan terhadap target, bukan terhadap AI count.
-    discrepancy = weight_estimation_pcs - target_qty
+    # Keputusan final harus dibandingkan terhadap target, menggunakan final count
+    discrepancy = final_count - target_qty
     reference_count = max(abs(target_qty), 1)
     discrepancy_pct = abs(discrepancy) / reference_count * 100
 
@@ -571,7 +583,7 @@ def sensor_fusion(ai_count, live_weight, base_weight, target_qty):
         status_color = "red"
         text = "NG"
 
-    return weight_estimation_pcs, discrepancy, status, status_color, text
+    return weight_estimation_pcs, final_count, discrepancy, status, status_color, text
 
 
 # ============================================================
@@ -918,7 +930,11 @@ with col_panel:
     st.markdown("---")
 
     metric_ai     = st.empty()
-    metric_lc     = st.empty()
+    col_w1, col_w2 = st.columns(2)
+    with col_w1:
+        metric_lc     = st.empty()
+    with col_w2:
+        metric_lc_count = st.empty()
     metric_final  = st.empty()
 
     st.markdown("---")
@@ -990,14 +1006,14 @@ if st.session_state.camera_running:
             frame_to_show = display_frame
 
         # --------------------------------------------------
-        # STEP 5: Load Cell (Mockup) -> GRAM
+        # STEP 5: Load Cell -> GRAM
         # --------------------------------------------------
         live_weight_g = get_load_cell_weight(ai_count, part_info['base_weight'])
 
         # --------------------------------------------------
         # STEP 6: Sensor Fusion
         # --------------------------------------------------
-        weight_est_pcs, discrepancy, status, status_color, text_ng = sensor_fusion(ai_count, live_weight_g, part_info['base_weight'], part_info['target_qty'])
+        weight_est_pcs, final_count, discrepancy, status, status_color, text_ng = sensor_fusion(ai_count, live_weight_g, part_info['base_weight'], part_info['target_qty'])
 
         # --------------------------------------------------
         # STEP 7: Update UI
@@ -1007,7 +1023,8 @@ if st.session_state.camera_running:
         # Metrics
         metric_ai.metric("🤖 AI Visual Count", f"{round(ai_count)} pcs")
         metric_lc.metric("⚖️ Live Weight Data", f"{live_weight_g:.2f} g")
-        metric_final.metric("📊 Weight Estimation", f"{weight_est_pcs} pcs")
+        metric_lc_count.metric("⚖️ Weight Count", f"{weight_est_pcs} pcs")
+        metric_final.metric("📊 Final Count", f"{final_count} pcs")
 
         # Status badge
         if status_color == "green":
@@ -1039,7 +1056,7 @@ if st.session_state.camera_running:
             f" font-family:JetBrains Mono,monospace; font-size:0.75rem; color:#64748b;'>"
             f"[{time.strftime('%H:%M:%S')}] "
             f"AI={round(ai_count)} | W={live_weight_g:.1f}g | "
-            f"Est={weight_est_pcs} | Δ={discrepancy} | "
+            f"Final={final_count} | Δ={discrepancy} | "
             f"Status={status}</div>",
             unsafe_allow_html=True,
         )
@@ -1068,7 +1085,7 @@ if st.session_state.camera_running:
                 part_info['target_qty'],
                 round(ai_count),
                 live_weight_g,
-                weight_est_pcs,
+                final_count,
                 discrepancy,
                 status,
                 image_url=proof_url,
@@ -1127,7 +1144,8 @@ else:
         st.markdown("---")
         metric_ai.metric("🤖 AI Visual Count", "—")
         metric_lc.metric("⚖️ Live Weight Data", "—")
-        metric_final.metric("📊 Weight Estimation", "—")
+        metric_lc_count.metric("⚖️ Weight Count", "—")
+        metric_final.metric("📊 Final Count", "—")
         status_placeholder.markdown(
             '<div class="status-verified" style="opacity:0.4;">STANDBY</div>',
             unsafe_allow_html=True,
